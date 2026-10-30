@@ -299,4 +299,140 @@ error_t attach_private_scalar(mem_t public_key_blob, mem_t private_scalar, mem_t
   return SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// Presigning
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr uint32_t presig_blob_version_v1 = 1;
+
+struct presig_blob_v1_t {
+  uint32_t version = presig_blob_version_v1;
+  uint32_t role = 0;   // 0=p1, 1=p2
+  uint32_t curve = 0;  // coinbase::api::curve_id
+  buf_t sid;
+  std::vector<coinbase::crypto::bn_t> k;
+  std::vector<coinbase::crypto::ecc_point_t> R;
+  std::vector<coinbase::crypto::ecc_point_t> R2;
+
+  void convert(coinbase::converter_t& c) { c.convert(version, role, curve, sid, k, R, R2); }
+};
+
+error_t serialize_presig_blob(const coinbase::mpc::ecdsa2pc::key_t& key, const coinbase::mpc::ecdsa2pc::presig_t& p,
+                              buf_t& out) {
+  curve_id cid;
+  if (!from_internal_curve(key.curve, cid)) return coinbase::error(E_BADARG, "unsupported curve");
+  presig_blob_v1_t blob;
+  blob.role = static_cast<uint32_t>(p.role);
+  blob.curve = static_cast<uint32_t>(cid);
+  blob.sid = p.sid;
+  blob.k = p.k;
+  blob.R = p.R;
+  blob.R2 = p.R2;
+  out = coinbase::convert(blob);
+  return SUCCESS;
+}
+
+// The presig must belong to this key: same role and curve, well-formed points on the key's curve,
+// nonces in range, and the same number of slots in every column.
+error_t deserialize_presig_blob(mem_t in, const coinbase::mpc::ecdsa2pc::key_t& key,
+                                coinbase::mpc::ecdsa2pc::presig_t& p) {
+  if (in.size < 4) return coinbase::error(E_FORMAT, "invalid presig blob");
+  const uint32_t version = coinbase::be_get_4(in.data);
+  if (version != presig_blob_version_v1) return coinbase::error(E_FORMAT, "unsupported presig blob version");
+
+  presig_blob_v1_t blob;
+  const error_t rv = coinbase::convert(blob, in);
+  if (rv) return rv;
+  if (blob.version != presig_blob_version_v1) return coinbase::error(E_FORMAT, "unsupported presig blob version");
+  if (blob.role > 1) return coinbase::error(E_FORMAT, "invalid presig blob role");
+  if (static_cast<coinbase::mpc::party_t>(static_cast<int32_t>(blob.role)) != key.role)
+    return coinbase::error(E_BADARG, "presig blob role mismatch key blob");
+
+  curve_id cid;
+  if (!from_internal_curve(key.curve, cid)) return coinbase::error(E_BADARG, "unsupported curve");
+  if (blob.curve != static_cast<uint32_t>(cid)) return coinbase::error(E_BADARG, "presig blob curve mismatch key blob");
+
+  const size_t n = blob.k.size();
+  if (n == 0 || n > static_cast<size_t>(coinbase::mpc::ecdsa2pc::MAX_PRESIGN_BATCH))
+    return coinbase::error(E_FORMAT, "invalid presig blob");
+  if (blob.R.size() != n || blob.R2.size() != n) return coinbase::error(E_FORMAT, "invalid presig blob");
+  if (blob.sid.empty()) return coinbase::error(E_FORMAT, "invalid presig blob");
+
+  const coinbase::crypto::mod_t& q = key.curve.order();
+  for (size_t i = 0; i < n; i++) {
+    if (!q.is_in_range(blob.k[i]) || blob.k[i].is_zero()) return coinbase::error(E_FORMAT, "invalid presig blob");
+    if (blob.R[i].get_curve() != key.curve || key.curve.check(blob.R[i]))
+      return coinbase::error(E_FORMAT, "invalid presig blob");
+    if (blob.R2[i].get_curve() != key.curve || key.curve.check(blob.R2[i]))
+      return coinbase::error(E_FORMAT, "invalid presig blob");
+  }
+
+  p.role = key.role;
+  p.sid = std::move(blob.sid);
+  p.k = std::move(blob.k);
+  p.R = std::move(blob.R);
+  p.R2 = std::move(blob.R2);
+  return SUCCESS;
+}
+
+error_t load_key_and_presig(mem_t key_blob, mem_t presig_blob, mem_t msg_hash, coinbase::mpc::ecdsa2pc::key_t& key,
+                            coinbase::mpc::ecdsa2pc::presig_t& presig) {
+  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
+                                                                          coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
+    return rv;
+  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(
+          presig_blob, "presig_blob", coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
+    return rv;
+  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(
+          msg_hash, "msg_hash", coinbase::api::detail::MAX_MESSAGE_DIGEST_SIZE))
+    return rv;
+  if (const error_t rv = deserialize_key_blob(key_blob, key)) return rv;
+  return deserialize_presig_blob(presig_blob, key, presig);
+}
+
+}  // namespace
+
+error_t presign(const coinbase::api::job_2p_t& job, mem_t key_blob, int n, buf_t& sid, buf_t& presig_blob) {
+  if (const error_t rv = validate_job_2p(job)) return rv;
+  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
+                                                                          coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
+    return rv;
+  if (n <= 0 || n > coinbase::mpc::ecdsa2pc::MAX_PRESIGN_BATCH) return coinbase::error(E_BADARG, "presign batch size");
+  coinbase::mpc::ecdsa2pc::key_t key;
+  error_t rv = deserialize_key_blob(key_blob, key);
+  if (rv) return rv;
+
+  const auto self = to_internal_party(job.self);
+  if (key.role != self) return coinbase::error(E_BADARG, "job.self mismatch key blob role");
+
+  coinbase::mpc::job_2p_t mpc_job = to_internal_job(job);
+
+  coinbase::mpc::ecdsa2pc::presig_t presig;
+  presig_blob.free();
+  rv = coinbase::mpc::ecdsa2pc::presign_batch(mpc_job, sid, key, n, presig);
+  if (rv) return rv;
+  return serialize_presig_blob(key, presig, presig_blob);
+}
+
+error_t presign_complete(mem_t key_blob, mem_t presig_blob, int index, mem_t msg_hash, buf_t& msg4) {
+  coinbase::mpc::ecdsa2pc::key_t key;
+  coinbase::mpc::ecdsa2pc::presig_t presig;
+  if (const error_t rv = load_key_and_presig(key_blob, presig_blob, msg_hash, key, presig)) return rv;
+  msg4.free();
+  return coinbase::mpc::ecdsa2pc::presign_complete_p2(key, presig, index, msg_hash, msg4);
+}
+
+error_t presign_finish(mem_t key_blob, mem_t presig_blob, int index, mem_t msg_hash, mem_t msg4, buf_t& sig_der) {
+  coinbase::mpc::ecdsa2pc::key_t key;
+  coinbase::mpc::ecdsa2pc::presig_t presig;
+  if (const error_t rv = load_key_and_presig(key_blob, presig_blob, msg_hash, key, presig)) return rv;
+  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(msg4, "msg4",
+                                                                          coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
+    return rv;
+  sig_der.free();
+  return coinbase::mpc::ecdsa2pc::presign_finish_p1(key, presig, index, msg_hash, msg4, sig_der);
+}
+
 }  // namespace coinbase::api::ecdsa_2p

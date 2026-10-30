@@ -77,4 +77,25 @@ error_t detach_private_scalar(mem_t key_blob, buf_t& out_public_key_blob, buf_t&
 error_t attach_private_scalar(mem_t public_key_blob, mem_t private_scalar, mem_t public_share_compressed,
                               buf_t& out_key_blob);
 
+// ---------------------------------------------------------------------------
+// Presigning (messages 1 to 3 ahead of the message)
+// ---------------------------------------------------------------------------
+
+// Run messages 1 to 3 of the signing protocol for `n` nonces (1 to 4096) before
+// any message is known. The output `presig_blob` is a versioned, opaque byte
+// string holding this party's nonces; it is as secret as the key blob. `sid`
+// is in/out as for `sign`.
+//
+// One slot signs one message. The caller must discard a slot after its first
+// use, whatever the outcome: a nonce used for two messages reveals the key.
+error_t presign(const coinbase::api::job_2p_t& job, mem_t key_blob, int n, buf_t& sid, buf_t& presig_blob);
+
+// P2 alone: message 4 for slot `index` of the presig and the given message
+// hash. The output is sent to P1.
+error_t presign_complete(mem_t key_blob, mem_t presig_blob, int index, mem_t msg_hash, buf_t& msg4);
+
+// P1 alone: verify P2's message 4 for slot `index` and the message hash, and
+// output the DER signature. A failure leaves no signature.
+error_t presign_finish(mem_t key_blob, mem_t presig_blob, int index, mem_t msg_hash, mem_t msg4, buf_t& sig_der);
+
 }  // namespace coinbase::api::ecdsa_2p

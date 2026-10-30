@@ -431,6 +431,169 @@ error_t sign_with_global_abort(job_2p_t& job, buf_t& sid, const key_t& key, cons
   return SUCCESS;
 }
 
+// ---- Presigning: see presig_t in the header. ----
+
+static error_t check_presig_slot(const key_t& key, const presig_t& presig, party_t role, int index) {
+  if (key.role != role || presig.role != role) return coinbase::error(E_BADARG, "ecdsa_2p: presig role mismatch");
+  const size_t n = presig.k.size();
+  if (presig.R.size() != n || presig.R2.size() != n) return coinbase::error(E_FORMAT, "ecdsa_2p: presig shape");
+  if (index < 0 || (size_t)index >= n) return coinbase::error(E_BADARG, "ecdsa_2p: presig index out of range");
+  return SUCCESS;
+}
+
+error_t presign_batch(job_2p_t& job, buf_t& sid, const key_t& key, int n, presig_t& out) {
+  error_t rv = UNINITIALIZED_ERROR;
+  if (n <= 0 || n > MAX_PRESIGN_BATCH) return coinbase::error(E_BADARG, "ecdsa_2p: presign batch size");
+  const ecurve_t curve = key.curve;
+  const auto& G = curve.generator();
+
+  if (sid.empty())
+    if (rv = generate_sid_fixed_2p(job, party_t::p2, sid)) return rv;
+
+  std::vector<bn_t> k1;
+  std::vector<bn_t> k2;
+  zk::uc_batch_dl_t pi_1, pi_2;
+  std::vector<ecc_point_t> R1;
+  std::vector<ecc_point_t> R2(n);
+  coinbase::crypto::commitment_t com(sid, job.get_pid(party_t::p1));
+
+  if (job.is_p1()) {
+    k1.resize(n);
+    R1.resize(n);
+    for (int i = 0; i < n; i++) {
+      k1[i] = curve.get_random_value();
+      R1[i] = k1[i] * G;
+    }
+    pi_1.prove(R1, k1, sid, 1);
+    // The messages are not known yet: the commitment covers R1 and its proof, as in the spec's message 1.
+    com.gen(R1, pi_1);
+  }
+
+  if (rv = job.p1_to_p2(com.msg)) return rv;
+
+  if (job.is_p2()) {
+    k2.resize(n);
+    for (int i = 0; i < n; i++) {
+      k2[i] = curve.get_random_value();
+      R2[i] = k2[i] * G;
+    }
+    pi_2.prove(R2, k2, sid, 2);
+  }
+
+  if (rv = job.p2_to_p1(R2, pi_2)) return rv;
+  if (job.is_p1() && R2.size() != (size_t)n)
+    return coinbase::error(E_CRYPTO, "ecdsa_2p: inconsistent batch size (R2)");
+
+  std::vector<ecc_point_t> R(n);
+
+  if (job.is_p1()) {
+    // Checking that R2 values are valid is done in the verify function.
+    if (rv = pi_2.verify(R2, sid, 2)) return rv;
+    for (int i = 0; i < n; i++) R[i] = k1[i] * R2[i];
+  }
+
+  if (rv = job.p1_to_p2(com.rand, R1, pi_1)) return rv;
+
+  if (job.is_p2()) {
+    if (R1.size() != (size_t)n) return coinbase::error(E_CRYPTO, "ecdsa_2p: inconsistent batch size (R1)");
+    if (rv = com.open(R1, pi_1)) return rv;
+    // Checking that R1 values are valid is done in the verify function.
+    if (rv = pi_1.verify(R1, sid, 1)) return rv;
+    for (int i = 0; i < n; i++) R[i] = k2[i] * R1[i];
+  }
+
+  out.role = key.role;
+  out.sid = sid;
+  if (job.is_p1())
+    out.k = std::move(k1);
+  else
+    out.k = std::move(k2);
+  out.R = std::move(R);
+  out.R2 = std::move(R2);
+  return SUCCESS;
+}
+
+// Message 4 for one slot, as in the stock sign (the proof-compatible message 4 of the spec's section 8).
+error_t presign_complete_p2(const key_t& key, const presig_t& presig, int index, mem_t msg, buf_t& msg4) {
+  error_t rv = UNINITIALIZED_ERROR;
+  if (rv = check_presig_slot(key, presig, party_t::p2, index)) return rv;
+  const ecurve_t curve = key.curve;
+  const auto& G = curve.generator();
+  const mod_t& q = curve.order();
+  const bn_t m = curve_msg_to_bn(msg, curve);
+  const bn_t& k2 = presig.k[index];
+  const bn_t r = presig.R[index].get_x() % q;
+
+  bn_t rho = bn_t::rand((q * q) << (SEC_P_STAT * 2));
+  bn_t rc;
+  if (rv = key.paillier.rand_N_star(rc, /*resample_until_coprime=*/false)) return coinbase::error(rv, "gcd(rc, N) != 1");
+
+  bn_t k2_inv;
+  bn_t temp;
+  MODULO(q) {
+    k2_inv = k2.inv();
+    temp = k2_inv * key.x_share;
+  }
+  temp = k2_inv * m + temp * r + rho * q;
+  auto c_tag = key.paillier.enc(temp, rc);
+
+  crypto::paillier_t::rerand_scope_t paillier_rerand(crypto::paillier_t::rerand_e::off);
+  crypto::paillier_t::elem_t c_key_tag = key.paillier.elem(key.c_key) + (q << SEC_P_STAT);
+  crypto::paillier_t::elem_t pai_c = (c_key_tag * (k2_inv * r)) + c_tag;
+  const bn_t c = pai_c.to_bn();
+
+  zk_ecdsa_sign_2pc_integer_commit_t zk;
+  if (rv = zk.prove(key.paillier, c_key_tag, pai_c, key.x_share * G, presig.R2[index], m, r, k2, key.x_share, rho, rc,
+                    presig.sid, (uint64_t)index))
+    return rv;
+  msg4 = coinbase::ser(c, zk);
+  return SUCCESS;
+}
+
+// P1's output step for one slot, as in the stock sign: verify the proof, decrypt, finish, verify the signature.
+error_t presign_finish_p1(const key_t& key, const presig_t& presig, int index, mem_t msg, mem_t msg4, buf_t& sig) {
+  error_t rv = UNINITIALIZED_ERROR;
+  if (rv = check_presig_slot(key, presig, party_t::p1, index)) return rv;
+  const ecurve_t curve = key.curve;
+  const auto& G = curve.generator();
+  const mod_t& q = curve.order();
+  const bn_t m = curve_msg_to_bn(msg, curve);
+  const bn_t& k1 = presig.k[index];
+  const bn_t r = presig.R[index].get_x() % q;
+
+  bn_t c;
+  zk_ecdsa_sign_2pc_integer_commit_t zk;
+  if (rv = coinbase::deser(msg4, c, zk)) return coinbase::error(rv, "ecdsa_2p: message 4 format");
+
+  {
+    crypto::paillier_t::rerand_scope_t paillier_rerand(crypto::paillier_t::rerand_e::off);
+    crypto::paillier_t::elem_t c_key_tag = key.paillier.elem(key.c_key) + (q << SEC_P_STAT);
+    crypto::paillier_t::elem_t pai_c = key.paillier.elem(c);
+    ecc_point_t Q_pub_share = key.x_share * G;
+    ecc_point_t Q_minus_xG = key.Q - Q_pub_share;
+    if (rv = zk.verify(curve, key.paillier, c_key_tag, pai_c, Q_minus_xG, presig.R2[index], m, r, presig.sid,
+                       (uint64_t)index))
+      return coinbase::error(rv, "zk_ecdsa_sign_2pc_integer_commit_t::verify failed");
+  }
+  {
+    crypto::vartime_scope_t vartime_scope;
+    if (rv = key.paillier.verify_cipher(c))
+      return coinbase::error(rv, "ecdsa_2p: invalid Paillier ciphertext from counterparty");
+  }
+
+  bn_t s = key.paillier.decrypt(c);
+  s = q.mod(s);
+  MODULO(q) { s /= k1; }
+  bn_t q_minus_s = q - s;
+  if (q_minus_s < s) s = q_minus_s;
+
+  crypto::ecdsa_signature_t out(curve, r, s);
+  sig = out.to_der();
+  crypto::ecc_pub_key_t ecc_verification_key(key.Q);
+  if (rv = ecc_verification_key.verify(msg, sig)) return coinbase::error(rv, "signature verification failed");
+  return SUCCESS;
+}
+
 error_t zk_ecdsa_sign_2pc_integer_commit_t::prove(const crypto::paillier_t& paillier,
                                                   const crypto::paillier_t::elem_t& c_key,
                                                   const crypto::paillier_t::elem_t& c, const ecc_point_t& Q2,

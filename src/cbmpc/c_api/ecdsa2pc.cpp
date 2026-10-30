@@ -259,4 +259,112 @@ cbmpc_error_t cbmpc_ecdsa_2p_attach_private_scalar(cmem_t public_key_blob, cmem_
   }
 }
 
+cbmpc_error_t cbmpc_ecdsa_2p_presign(const cbmpc_2pc_job_t* job, cmem_t key_blob, int32_t n, cmem_t sid_in,
+                                     cmem_t* sid_out, cmem_t* out_presig_blob) {
+  try {
+    if (sid_out) *sid_out = cmem_t{nullptr, 0};
+    if (!out_presig_blob) return E_BADARG;
+    *out_presig_blob = cmem_t{nullptr, 0};
+
+    const auto vjob = validate_2pc_job(job);
+    if (vjob) return vjob;
+    const auto vkb = validate_cmem(key_blob);
+    if (vkb) return vkb;
+    const auto vsi = validate_cmem(sid_in);
+    if (vsi) return vsi;
+
+    coinbase::api::party_2p_t self_cpp;
+    const auto pconv = to_cpp_party(job->self, self_cpp);
+    if (pconv) return pconv;
+
+    job_2p_cpp_ctx_t ctx(job, self_cpp);
+    coinbase::buf_t sid(sid_in.data, sid_in.size);
+    coinbase::buf_t presig;
+
+    const coinbase::error_t rv = coinbase::api::ecdsa_2p::presign(ctx.job, view_cmem(key_blob), n, sid, presig);
+    if (rv) return rv;
+
+    const auto r_presig = alloc_cmem_from_buf(presig, out_presig_blob);
+    if (r_presig) return r_presig;
+
+    if (sid_out) {
+      const auto r_sid = alloc_cmem_from_buf(sid, sid_out);
+      if (r_sid) {
+        cbmpc_cmem_free(*out_presig_blob);
+        *out_presig_blob = cmem_t{nullptr, 0};
+        return r_sid;
+      }
+    }
+    return CBMPC_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    if (sid_out) *sid_out = cmem_t{nullptr, 0};
+    if (out_presig_blob) {
+      cbmpc_cmem_free(*out_presig_blob);
+      *out_presig_blob = cmem_t{nullptr, 0};
+    }
+    return E_INSUFFICIENT;
+  } catch (...) {
+    if (sid_out) *sid_out = cmem_t{nullptr, 0};
+    if (out_presig_blob) {
+      cbmpc_cmem_free(*out_presig_blob);
+      *out_presig_blob = cmem_t{nullptr, 0};
+    }
+    return E_GENERAL;
+  }
+}
+
+cbmpc_error_t cbmpc_ecdsa_2p_presign_complete(cmem_t key_blob, cmem_t presig_blob, int32_t index, cmem_t msg_hash,
+                                              cmem_t* out_msg4) {
+  try {
+    if (!out_msg4) return E_BADARG;
+    *out_msg4 = cmem_t{nullptr, 0};
+    const auto vkb = validate_cmem(key_blob);
+    if (vkb) return vkb;
+    const auto vpb = validate_cmem(presig_blob);
+    if (vpb) return vpb;
+    const auto vmh = validate_cmem(msg_hash);
+    if (vmh) return vmh;
+
+    coinbase::buf_t msg4;
+    const coinbase::error_t rv = coinbase::api::ecdsa_2p::presign_complete(view_cmem(key_blob), view_cmem(presig_blob),
+                                                                          index, view_cmem(msg_hash), msg4);
+    if (rv) return rv;
+    return alloc_cmem_from_buf(msg4, out_msg4);
+  } catch (const std::bad_alloc&) {
+    if (out_msg4) *out_msg4 = cmem_t{nullptr, 0};
+    return E_INSUFFICIENT;
+  } catch (...) {
+    if (out_msg4) *out_msg4 = cmem_t{nullptr, 0};
+    return E_GENERAL;
+  }
+}
+
+cbmpc_error_t cbmpc_ecdsa_2p_presign_finish(cmem_t key_blob, cmem_t presig_blob, int32_t index, cmem_t msg_hash,
+                                            cmem_t msg4, cmem_t* sig_der_out) {
+  try {
+    if (!sig_der_out) return E_BADARG;
+    *sig_der_out = cmem_t{nullptr, 0};
+    const auto vkb = validate_cmem(key_blob);
+    if (vkb) return vkb;
+    const auto vpb = validate_cmem(presig_blob);
+    if (vpb) return vpb;
+    const auto vmh = validate_cmem(msg_hash);
+    if (vmh) return vmh;
+    const auto vm4 = validate_cmem(msg4);
+    if (vm4) return vm4;
+
+    coinbase::buf_t sig;
+    const coinbase::error_t rv = coinbase::api::ecdsa_2p::presign_finish(
+        view_cmem(key_blob), view_cmem(presig_blob), index, view_cmem(msg_hash), view_cmem(msg4), sig);
+    if (rv) return rv;
+    return alloc_cmem_from_buf(sig, sig_der_out);
+  } catch (const std::bad_alloc&) {
+    if (sig_der_out) *sig_der_out = cmem_t{nullptr, 0};
+    return E_INSUFFICIENT;
+  } catch (...) {
+    if (sig_der_out) *sig_der_out = cmem_t{nullptr, 0};
+    return E_GENERAL;
+  }
+}
+
 }  // extern "C"

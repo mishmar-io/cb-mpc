@@ -117,4 +117,28 @@ struct zk_ecdsa_sign_2pc_integer_commit_t {
                  const bn_t& r, mem_t sid, uint64_t aux) const;
 };
 
+
+/**
+ * Presigning: messages 1 to 3 of ECDSA-2PC-Sign-2P run ahead of the message
+ * for a batch of n nonces, so that when a message comes P2 produces message 4
+ * alone and P1 verifies and finishes alone. The message enters the protocol
+ * only at message 4, and the commitment of message 1 covers R1 and its proof,
+ * as in the spec. One slot signs one message: the caller must discard a slot
+ * after its first use, whatever the outcome, since a nonce used twice reveals
+ * the key.
+ */
+struct presig_t {
+  party_t role;
+  buf_t sid;
+  std::vector<bn_t> k;          // this party's nonces: k1 on P1, k2 on P2
+  std::vector<ecc_point_t> R;   // the joint nonce points, k1·R2 = k2·R1
+  std::vector<ecc_point_t> R2;  // P2's nonce points, part of the statement P2 proves
+};
+
+constexpr int MAX_PRESIGN_BATCH = 4096;
+
+error_t presign_batch(job_2p_t& job, buf_t& sid, const key_t& key, int n, presig_t& out);
+error_t presign_complete_p2(const key_t& key, const presig_t& presig, int index, mem_t msg, buf_t& msg4);
+error_t presign_finish_p1(const key_t& key, const presig_t& presig, int index, mem_t msg, mem_t msg4, buf_t& sig);
+
 }  // namespace coinbase::mpc::ecdsa2pc

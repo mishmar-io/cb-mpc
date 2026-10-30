@@ -84,6 +84,32 @@ cbmpc_error_t cbmpc_ecdsa_2p_detach_private_scalar(cmem_t key_blob, cmem_t* out_
 cbmpc_error_t cbmpc_ecdsa_2p_attach_private_scalar(cmem_t public_key_blob, cmem_t private_scalar,
                                                    cmem_t public_share_compressed, cmem_t* out_key_blob);
 
+// ---------------------------------------------------------------------------
+// Presigning: messages 1 to 3 ahead of the message
+// ---------------------------------------------------------------------------
+
+// Run messages 1 to 3 of signing for `n` nonces (1 to 4096) before any message
+// is known. Outputs this party's presig blob (as secret as the key blob) and
+// the session id used. One slot signs one message: discard a slot after its
+// first use, whatever the outcome.
+//
+// Ownership: as `cbmpc_ecdsa_2p_sign` (`out_presig_blob` and `sid_out`).
+cbmpc_error_t cbmpc_ecdsa_2p_presign(const cbmpc_2pc_job_t* job, cmem_t key_blob, int32_t n, cmem_t sid_in,
+                                     cmem_t* sid_out, cmem_t* out_presig_blob);
+
+// P2 alone: message 4 for slot `index` and `msg_hash`, to send to P1.
+//
+// Ownership: on success `out_msg4->data` must be freed with `cbmpc_cmem_free`.
+cbmpc_error_t cbmpc_ecdsa_2p_presign_complete(cmem_t key_blob, cmem_t presig_blob, int32_t index, cmem_t msg_hash,
+                                              cmem_t* out_msg4);
+
+// P1 alone: verify P2's message 4 for slot `index` and `msg_hash`, output the
+// DER signature. A failure leaves `*sig_der_out` as `{NULL, 0}`.
+//
+// Ownership: on success `sig_der_out->data` must be freed with `cbmpc_cmem_free`.
+cbmpc_error_t cbmpc_ecdsa_2p_presign_finish(cmem_t key_blob, cmem_t presig_blob, int32_t index, cmem_t msg_hash,
+                                            cmem_t msg4, cmem_t* sig_der_out);
+
 #ifdef __cplusplus
 }
 #endif
