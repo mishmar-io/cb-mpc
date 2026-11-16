@@ -1,3 +1,5 @@
+#include <utility>
+
 #include <cbmpc/internal/protocol/agree_random.h>
 #include <cbmpc/internal/protocol/ec_dkg.h>
 #include <cbmpc/internal/protocol/ecdsa_2p.h>
@@ -240,13 +242,13 @@ error_t refresh(job_2p_t& job, const key_t& key, key_t& new_key) {
 
 error_t sign_batch_impl(job_2p_t& job, buf_t& sid, const key_t& key, const std::vector<mem_t>& msgs, int sign_mode_flag,
                         std::vector<buf_t>& sigs) {
+  sigs.clear();
   error_t rv = UNINITIALIZED_ERROR;
 
   bool global_abort_mode = sign_mode_flag == SIGN_MODE_GLOBAL_ABORT;
 
   auto n_sigs = msgs.size();
   if (n_sigs == 0) return coinbase::error(E_BADARG, "ecdsa_2p: empty batch");
-  sigs.resize(n_sigs);
   const ecurve_t curve = key.curve;
   const auto& G = curve.generator();
   const mod_t& q = curve.order();
@@ -266,6 +268,7 @@ error_t sign_batch_impl(job_2p_t& job, buf_t& sid, const key_t& key, const std::
   std::vector<ecc_point_t> R2(n_sigs);
   coinbase::crypto::commitment_t com(sid, job.get_pid(party_t::p1));
 
+  std::vector<buf_t> candidate_sigs(n_sigs);
   if (job.is_p1()) {
     k1.resize(n_sigs);
     R1.resize(n_sigs);
@@ -295,7 +298,9 @@ error_t sign_batch_impl(job_2p_t& job, buf_t& sid, const key_t& key, const std::
   std::vector<ecc_point_t> R(n_sigs);
 
   if (job.is_p1()) {
-    // Checking that R2 values are valid is done in the verify function.
+    for (int i = 0; i < n_sigs; i++) {
+      if (rv = curve.check(R2[i])) return coinbase::error(rv, "ecdsa_2p: R2 is not on the signing curve");
+    }
     if (rv = pi_2.verify(R2, sid, 2)) return rv;
     for (int i = 0; i < n_sigs; i++) {
       R[i] = k1[i] * R2[i];
@@ -313,7 +318,9 @@ error_t sign_batch_impl(job_2p_t& job, buf_t& sid, const key_t& key, const std::
     if (R1.size() != n_sigs) return coinbase::error(E_CRYPTO, "ecdsa_2p: inconsistent batch size (R1)");
     if (rv = com.open(msgs, R1, pi_1)) return rv;
 
-    // Checking that R1 values are valid is done in the verify function.
+    for (int i = 0; i < n_sigs; i++) {
+      if (rv = curve.check(R1[i])) return coinbase::error(rv, "ecdsa_2p: R1 is not on the signing curve");
+    }
     if (rv = pi_1.verify(R1, sid, 1)) return rv;
     for (int i = 0; i < n_sigs; i++) {
       R[i] = k2[i] * R1[i];
@@ -358,6 +365,10 @@ error_t sign_batch_impl(job_2p_t& job, buf_t& sid, const key_t& key, const std::
     if (c.size() != n_sigs) return coinbase::error(E_CRYPTO, "ecdsa_2p: inconsistent batch size (c)");
     if (!global_abort_mode && zk_ecdsa.size() != n_sigs)
       return coinbase::error(E_CRYPTO, "ecdsa_2p: inconsistent batch size (zk_ecdsa)");
+    const mod_t& N = key.paillier.get_N();
+    // N is odd, so (N + 1) / 2 is the first integer in the upper half of [0, N).
+    const bn_t N_half = (N.value() + 1) >> 1;
+    const bn_t N_mod_q = q.mod(N.value());
     for (int i = 0; i < n_sigs; i++) {
       r[i] = R[i].get_x() % q;
 
@@ -380,7 +391,9 @@ error_t sign_batch_impl(job_2p_t& job, buf_t& sid, const key_t& key, const std::
       }
 
       bn_t s = key.paillier.decrypt(c[i]);
+      const bool is_negative = (s >= N_half);
       s = q.mod(s);
+      MODULO(q) { s -= N_mod_q * static_cast<int>(is_negative); }
 
       MODULO(q) { s /= k1[i]; }
 
@@ -388,11 +401,11 @@ error_t sign_batch_impl(job_2p_t& job, buf_t& sid, const key_t& key, const std::
       if (q_minus_s < s) s = q_minus_s;
 
       crypto::ecdsa_signature_t sig(curve, r[i], s);
-      sigs[i] = sig.to_der();
+      candidate_sigs[i] = sig.to_der();
 
       // verify
       crypto::ecc_pub_key_t ecc_verification_key(key.Q);
-      if (rv = ecc_verification_key.verify(msgs[i], sigs[i]))
+      if (rv = ecc_verification_key.verify(msgs[i], candidate_sigs[i]))
         if (global_abort_mode)
           return coinbase::error(E_ECDSA_2P_BIT_LEAK, "signature verification failed");
         else
@@ -400,6 +413,7 @@ error_t sign_batch_impl(job_2p_t& job, buf_t& sid, const key_t& key, const std::
     }
   }
 
+  sigs = std::move(candidate_sigs);
   return SUCCESS;
 }
 
@@ -409,6 +423,7 @@ error_t sign_batch(job_2p_t& job, buf_t& sid, const key_t& key, const std::vecto
 }
 
 error_t sign(job_2p_t& job, buf_t& sid, const key_t& key, const mem_t msg, buf_t& sig) {
+  sig.free();
   error_t rv = UNINITIALIZED_ERROR;
   std::vector<mem_t> msgs(1, msg);
   std::vector<buf_t> sigs;
@@ -423,6 +438,7 @@ error_t sign_with_global_abort_batch(job_2p_t& job, buf_t& sid, const key_t& key
 }
 
 error_t sign_with_global_abort(job_2p_t& job, buf_t& sid, const key_t& key, const mem_t msg, buf_t& sig) {
+  sig.free();
   error_t rv = UNINITIALIZED_ERROR;
   std::vector<mem_t> msgs(1, msg);
   std::vector<buf_t> sigs;
@@ -487,7 +503,9 @@ error_t presign_batch(job_2p_t& job, buf_t& sid, const key_t& key, int n, presig
   std::vector<ecc_point_t> R(n);
 
   if (job.is_p1()) {
-    // Checking that R2 values are valid is done in the verify function.
+    for (int i = 0; i < n; i++) {
+      if (rv = curve.check(R2[i])) return coinbase::error(rv, "ecdsa_2p: R2 is not on the signing curve");
+    }
     if (rv = pi_2.verify(R2, sid, 2)) return rv;
     for (int i = 0; i < n; i++) R[i] = k1[i] * R2[i];
   }
@@ -497,7 +515,9 @@ error_t presign_batch(job_2p_t& job, buf_t& sid, const key_t& key, int n, presig
   if (job.is_p2()) {
     if (R1.size() != (size_t)n) return coinbase::error(E_CRYPTO, "ecdsa_2p: inconsistent batch size (R1)");
     if (rv = com.open(R1, pi_1)) return rv;
-    // Checking that R1 values are valid is done in the verify function.
+    for (int i = 0; i < n; i++) {
+      if (rv = curve.check(R1[i])) return coinbase::error(rv, "ecdsa_2p: R1 is not on the signing curve");
+    }
     if (rv = pi_1.verify(R1, sid, 1)) return rv;
     for (int i = 0; i < n; i++) R[i] = k2[i] * R1[i];
   }
@@ -515,6 +535,7 @@ error_t presign_batch(job_2p_t& job, buf_t& sid, const key_t& key, int n, presig
 
 // Message 4 for one slot, as in the stock sign (the proof-compatible message 4 of the spec's section 8).
 error_t presign_complete_p2(const key_t& key, const presig_t& presig, int index, mem_t msg, buf_t& msg4) {
+  msg4.free();
   error_t rv = UNINITIALIZED_ERROR;
   if (rv = check_presig_slot(key, presig, party_t::p2, index)) return rv;
   const ecurve_t curve = key.curve;
@@ -552,6 +573,7 @@ error_t presign_complete_p2(const key_t& key, const presig_t& presig, int index,
 
 // P1's output step for one slot, as in the stock sign: verify the proof, decrypt, finish, verify the signature.
 error_t presign_finish_p1(const key_t& key, const presig_t& presig, int index, mem_t msg, mem_t msg4, buf_t& sig) {
+  sig.free();
   error_t rv = UNINITIALIZED_ERROR;
   if (rv = check_presig_slot(key, presig, party_t::p1, index)) return rv;
   const ecurve_t curve = key.curve;
@@ -581,16 +603,25 @@ error_t presign_finish_p1(const key_t& key, const presig_t& presig, int index, m
       return coinbase::error(rv, "ecdsa_2p: invalid Paillier ciphertext from counterparty");
   }
 
+  const mod_t& N = key.paillier.get_N();
+  // N is odd, so (N + 1) / 2 is the first integer in the upper half of [0, N).
+  const bn_t N_half = (N.value() + 1) >> 1;
+  const bn_t N_mod_q = q.mod(N.value());
+
   bn_t s = key.paillier.decrypt(c);
+  const bool is_negative = (s >= N_half);
   s = q.mod(s);
+  MODULO(q) { s -= N_mod_q * static_cast<int>(is_negative); }
   MODULO(q) { s /= k1; }
   bn_t q_minus_s = q - s;
   if (q_minus_s < s) s = q_minus_s;
 
   crypto::ecdsa_signature_t out(curve, r, s);
-  sig = out.to_der();
+  buf_t candidate_sig = out.to_der();
   crypto::ecc_pub_key_t ecc_verification_key(key.Q);
-  if (rv = ecc_verification_key.verify(msg, sig)) return coinbase::error(rv, "signature verification failed");
+  if (rv = ecc_verification_key.verify(msg, candidate_sig))
+    return coinbase::error(rv, "signature verification failed");
+  sig = std::move(candidate_sig);
   return SUCCESS;
 }
 
@@ -698,6 +729,13 @@ error_t zk_ecdsa_sign_2pc_integer_commit_t::verify(const ecurve_t curve, const c
   const mod_t& q = curve.order();
   const auto& G = curve.generator();
 
+  if (rv = curve.check(Q2)) return coinbase::error(rv, "zk_ecdsa_sign_2pc_integer_commit_t::verify: check Q2 failed");
+  if (rv = curve.check(R2)) return coinbase::error(rv, "zk_ecdsa_sign_2pc_integer_commit_t::verify: check R2 failed");
+  if (rv = curve.check(G_tag))
+    return coinbase::error(rv, "zk_ecdsa_sign_2pc_integer_commit_t::verify: check G_tag failed");
+  if (rv = curve.check(Q2_tag))
+    return coinbase::error(rv, "zk_ecdsa_sign_2pc_integer_commit_t::verify: check Q2_tag failed");
+
   buf_t e_buf = crypto::ro::hash_string(N, c_key, c, Q2, R2, m_tag, r, W1, W2, W3, W1_tag, W2_tag, W3_tag, G_tag,
                                         Q2_tag, C_enc_tag, sid, aux)
                     .bitlen(SEC_P_COM);
@@ -709,13 +747,6 @@ error_t zk_ecdsa_sign_2pc_integer_commit_t::verify(const ecurve_t curve, const c
   if (rv = check_right_open_range(0, r1_w_tag_tag, N_ped << (2 * SEC_P_STAT + SEC_P_COM + 1))) return rv;
   if (rv = check_right_open_range(0, r2_w_tag_tag, N_ped << (2 * SEC_P_STAT + SEC_P_COM + 1))) return rv;
   if (rv = check_right_open_range(0, r3_w_tag_tag, N_ped << (2 * SEC_P_STAT + SEC_P_COM + 1))) return rv;
-
-  if (rv = curve.check(Q2)) return coinbase::error(rv, "zk_ecdsa_sign_2pc_integer_commit_t::verify: check Q2 failed");
-  if (rv = curve.check(R2)) return coinbase::error(rv, "zk_ecdsa_sign_2pc_integer_commit_t::verify: check R2 failed");
-  if (rv = curve.check(G_tag))
-    return coinbase::error(rv, "zk_ecdsa_sign_2pc_integer_commit_t::verify: check G_tag failed");
-  if (rv = curve.check(Q2_tag))
-    return coinbase::error(rv, "zk_ecdsa_sign_2pc_integer_commit_t::verify: check Q2_tag failed");
 
   if (rv = check_right_open_range(0, m_tag, q)) return rv;
   if (rv = check_right_open_range(0, r, q)) return rv;

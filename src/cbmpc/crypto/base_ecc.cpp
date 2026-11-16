@@ -596,6 +596,7 @@ error_t ecurve_t::check(const ecc_point_t& point) const {
 void ecurve_t::convert(coinbase::converter_t& converter) {
   uint16_t curve_code = ptr ? ptr->openssl_code : 0;
   converter.convert(curve_code);
+  if (converter.is_error()) return;
   if (curve_code) {
     ecurve_t curve = ecurve_t::find(curve_code);
     if (!curve) {
@@ -603,8 +604,12 @@ void ecurve_t::convert(coinbase::converter_t& converter) {
       return;
     }
     ptr = curve.ptr;
-  } else
+  } else if (converter.is_write()) {
     ptr = nullptr;
+  } else {
+    converter.set_error();
+    return;
+  }
 }
 
 ecc_point_t ecurve_t::infinity() const {
