@@ -156,6 +156,7 @@ using internal_sign_fn_t = error_t (*)(coinbase::mpc::job_2p_t&, buf_t& /*sid*/,
 
 static error_t sign_common(internal_sign_fn_t fn, const coinbase::api::job_2p_t& job, mem_t key_blob, mem_t msg_hash,
                            buf_t& sid, buf_t& sig_der) {
+  sig_der.free();
   if (const error_t rv = validate_job_2p(job)) return rv;
   if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
                                                                           coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
@@ -171,8 +172,6 @@ static error_t sign_common(internal_sign_fn_t fn, const coinbase::api::job_2p_t&
   if (key.role != self) return coinbase::error(E_BADARG, "job.self mismatch key blob role");
 
   coinbase::mpc::job_2p_t mpc_job = to_internal_job(job);
-
-  sig_der.free();
   return fn(mpc_job, sid, key, msg_hash, sig_der);
 }
 
@@ -417,21 +416,21 @@ error_t presign(const coinbase::api::job_2p_t& job, mem_t key_blob, int n, buf_t
 }
 
 error_t presign_complete(mem_t key_blob, mem_t presig_blob, int index, mem_t msg_hash, buf_t& msg4) {
+  msg4.free();
   coinbase::mpc::ecdsa2pc::key_t key;
   coinbase::mpc::ecdsa2pc::presig_t presig;
   if (const error_t rv = load_key_and_presig(key_blob, presig_blob, msg_hash, key, presig)) return rv;
-  msg4.free();
   return coinbase::mpc::ecdsa2pc::presign_complete_p2(key, presig, index, msg_hash, msg4);
 }
 
 error_t presign_finish(mem_t key_blob, mem_t presig_blob, int index, mem_t msg_hash, mem_t msg4, buf_t& sig_der) {
+  sig_der.free();
   coinbase::mpc::ecdsa2pc::key_t key;
   coinbase::mpc::ecdsa2pc::presig_t presig;
   if (const error_t rv = load_key_and_presig(key_blob, presig_blob, msg_hash, key, presig)) return rv;
   if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(msg4, "msg4",
                                                                           coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
     return rv;
-  sig_der.free();
   return coinbase::mpc::ecdsa2pc::presign_finish_p1(key, presig, index, msg_hash, msg4, sig_der);
 }
 
